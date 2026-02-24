@@ -47,7 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "teensy4" => {
                 RuntimeBuilder::from_flexspi(Family::Imxrt1060, 1984 * 1024)
                     .rodata(Memory::Dtcm)
-                    .stack_size(32 * 1024)
+                    .stack_size(48 * 1024)
                     .build()?;
                 println!("cargo:rustc-cfg=board=\"teensy4\"");
                 println!("cargo:rustc-cfg=chip=\"imxrt1060\"");

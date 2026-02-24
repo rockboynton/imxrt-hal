@@ -57,6 +57,10 @@ version = "0.5"
 default-features = false
 optional = true
 
+[dependencies.imxrt-enet]
+workspace = true
+optional = true
+
 # This is an indirect dependency through imxrt-ral;
 # imxrt-ral depends on `ral-registers 0.1.0`,
 # but we are using newer features.
@@ -95,10 +99,10 @@ features = ["imxrt-ral/imxrt1062", "imxrt1060"]
 [features]
 default = ["imxrt-usbd"]
 imxrt1010 = ["imxrt-iomuxc/imxrt1010"]
-imxrt1020 = ["imxrt-iomuxc/imxrt1020"]
-imxrt1060 = ["imxrt-iomuxc/imxrt1060"]
-imxrt1064 = ["imxrt-iomuxc/imxrt1060"]
-imxrt1170 = ["imxrt-iomuxc/imxrt1170"]
+imxrt1020 = ["imxrt-iomuxc/imxrt1020", "imxrt-enet"]
+imxrt1060 = ["imxrt-iomuxc/imxrt1060", "imxrt-enet"]
+imxrt1064 = ["imxrt-iomuxc/imxrt1060", "imxrt-enet"]
+imxrt1170 = ["imxrt-iomuxc/imxrt1170", "imxrt-enet"]
 imxrt1180 = ["imxrt-iomuxc/imxrt1180"]
 
 ################
@@ -114,6 +118,7 @@ members = ["board", "logging"]
 
 [workspace.dependencies]
 imxrt-dma = "0.1"
+imxrt-enet = { git = "https://github.com/mciantyre/imxrt-enet" }
 imxrt-iomuxc = "0.3.0"
 imxrt-hal = { version = "0.6", path = "." }
 imxrt-log = { path = "logging", default-features = false, features = [
