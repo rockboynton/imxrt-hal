@@ -17,6 +17,8 @@ pub(crate) mod iomuxc {
 
 mod drivers {
     pub mod dma;
+    pub mod gpc;
+    pub mod pmu;
     pub mod gpio;
     pub mod pit;
     pub mod sai;
