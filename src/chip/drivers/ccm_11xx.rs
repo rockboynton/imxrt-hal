@@ -11,7 +11,7 @@ pub mod output_source;
 
 pub use crate::common::ccm::XTAL_OSCILLATOR_HZ;
 
-pub use crate::gpc::{ControlMode, Setpoint};
+pub use crate::selection::drivers::gpc::{ControlMode, Setpoint};
 use crate::ral::{self, ccm::CCM};
 
 /// A clock source.

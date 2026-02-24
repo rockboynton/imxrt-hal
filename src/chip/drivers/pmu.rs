@@ -4,7 +4,7 @@
 //! Note that the terms "PHY LDO" and `LDO_PLL` represent
 //! the same thing, and this API prefers the PHY LDO term.
 
-pub use crate::gpc::{ControlMode, Setpoint};
+pub use crate::selection::driver::gpc::{ControlMode, Setpoint};
 use crate::ral::{self, anadig_pmu::ANADIG_PMU as PMU};
 
 /// Set the control mode for PHY LDO.
