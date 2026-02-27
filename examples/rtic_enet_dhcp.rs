@@ -32,6 +32,7 @@ mod app {
     const SOCKET_DEMO: SocketDemo = SocketDemo::TcpLoopback;
 
     use board::smoltcp;
+    use board::smoltcp::iface::PollResult;
     use hal::enet;
     use imxrt_hal as hal;
 
@@ -177,7 +178,7 @@ mod app {
                 loop {
                     time += 10;
                     delay.block_ms(10);
-                    if iface.poll(Instant::from_millis(time), &mut dev, &mut sockets) {
+                    if iface.poll(Instant::from_millis(time), &mut dev, &mut sockets) == PollResult::SocketStateChanged {
                         let tcp_socket: &mut tcp::Socket = sockets.get_mut(socket_handle);
                         let available = match tcp_socket.recv_slice(msg) {
                             Err(tcp::RecvError::InvalidState) => {

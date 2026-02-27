@@ -1,6 +1,10 @@
 //! i.MX RT 1170 EVK board configuration, supporting CM7 applications.
 
-use crate::{hal, iomuxc::imxrt1170 as iomuxc, ral, GPT1_DIVIDER, GPT2_DIVIDER, RUN_MODE};
+use crate::{
+    GPT1_DIVIDER, GPT2_DIVIDER, RUN_MODE,
+    hal::{self, iomuxc},
+    ral,
+};
 
 mod imxrt11xx {
     pub(super) mod clock_tree;
@@ -24,7 +28,13 @@ fn defmt_panic() -> ! {
 pub(crate) const DEFAULT_LOGGING_BACKEND: crate::logging::Backend = crate::logging::Backend::Lpuart;
 
 use hal::ccm::clock_gate;
+
+/// Ethernet MAC address for the board.
+pub const ENET_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+
 const CLOCK_GATES: &[clock_gate::Locator] = &[
+    clock_gate::iomuxc(),
+    clock_gate::iomuxc_lpsr(),
     clock_gate::gpio(),
     clock_gate::dma(),
     clock_gate::pit::<1>(),
@@ -38,26 +48,67 @@ const CLOCK_GATES: &[clock_gate::Locator] = &[
     clock_gate::snvs(),
 ];
 
-pub(crate) unsafe fn configure() {
-    let mut ccm = ral::ccm::CCM::instance();
+const ENET_CLOCK_GATES: &[clock_gate::Locator] = &[
+    clock_gate::enet(),
+    clock_gate::enet_1g(),
+    clock_gate::enet_qos(),
+];
+
+/// Configure the chip
+///
+/// # Safety
+///
+/// Ensure this is only called once and nothing else is accessing/owns the RAL at the same time
+///
+/// # Panics
+///
+/// Panics if GPC control mode configuration fails or setpoint transition request fails
+pub unsafe fn configure() {
+    // SAFETY: caller invariant
+    let mut ccm = unsafe { ral::ccm::CCM::instance() };
+
+    // SAFETY: caller ensures exclusive access to RAL
+    let gpc = unsafe { ral::gpc_cpu_mode_ctrl_::GPC_CPU_MODE_CTRL_0::instance() };
+    let gpc = &*gpc;
+    // SAFETY: caller ensures exclusive access to RAL
+    let pll = unsafe { ral::anadig_pll::ANADIG_PLL::instance() };
+    // SAFETY: caller ensures exclusive access to RAL
+    let mut pmu = unsafe { ral::anadig_pmu::ANADIG_PMU::instance() };
+
+    hal::pmu::enable_pll_reference_voltage(&mut pmu, true);
+    hal::pmu::set_phy_ldo_setpoints(&pmu, hal::pmu::Setpoint::all());
+    hal::pmu::set_phy_ldo_control(&mut pmu, hal::pmu::ControlMode::Gpc);
+    hal::pmu::set_pll_reference_control(&mut pmu, hal::pmu::ControlMode::Gpc);
+
+    for clock_source in {
+        use hal::ccm::ClockSource::{Pll1, Pll1Clk, Pll1Div2, Pll1Div5};
+        [Pll1, Pll1Clk, Pll1Div2, Pll1Div5]
+    } {
+        let oscpll = &ccm.OSCPLL[clock_source as usize];
+        ral::write_reg!(ral::ccm::oscpll, oscpll, OSCPLL_DIRECT, 0);
+        hal::ccm::set_setpoints(&mut ccm, clock_source, hal::ccm::Setpoint::SP1);
+        hal::ccm::set_gpc_control_mode(&mut ccm, clock_source, hal::ccm::ControlMode::Gpc).unwrap();
+    }
+
+    ral::modify_reg!(ral::anadig_pll, pll, SYS_PLL1_CTRL,
+        SYS_PLL1_CONTROL_MODE: 1,
+        SYS_PLL1_DIV2_CONTROL_MODE: 1,
+        SYS_PLL1_DIV5_CONTROL_MODE: 1,
+    );
 
     prepare_clock_tree(&mut ccm);
-    CLOCK_GATES
-        .iter()
-        .for_each(|locator| locator.set(&mut ccm, clock_gate::ON));
+    for locator in CLOCK_GATES {
+        locator.set(&mut ccm, clock_gate::ON);
+    }
 
-    ENET_CLOCK_GATES
-        .iter()
-        .for_each(|l| l.set(&mut ccm, clock_gate::OFF));
-    clock_tree::enet_root_on(&mut ccm, false);
+    for l in ENET_CLOCK_GATES { l.set(&mut ccm, clock_gate::OFF); }
+    clock_tree::enet_root_on(&ccm, false);
 
-    clock_tree::configure_enet(RUN_MODE, &mut ccm);
+    clock_tree::configure_enet(RUN_MODE, &ccm);
     hal::gpc::request_setpoint_transition(gpc, 1).unwrap();
 
-    clock_tree::enet_root_on(&mut ccm, true);
-    ENET_CLOCK_GATES
-        .iter()
-        .for_each(|l| l.set(&mut ccm, clock_gate::ON));
+    clock_tree::enet_root_on(&ccm, true);
+    for l in ENET_CLOCK_GATES { l.set(&mut ccm, clock_gate::ON); }
 }
 
 fn prepare_clock_tree(ccm: &mut ral::ccm::CCM) {
@@ -69,82 +120,86 @@ fn prepare_clock_tree(ccm: &mut ral::ccm::CCM) {
     clock_tree::configure_lpi2c::<{ I2C_INSTANCE }>(RUN_MODE, ccm);
 }
 
+/// PIT timer frequency in Hz.
 pub const PIT_FREQUENCY: u32 = clock_tree::bus_frequency(RUN_MODE);
+/// GPT1 timer frequency in Hz.
 pub const GPT1_FREQUENCY: u32 = clock_tree::gpt_frequency::<1>(RUN_MODE) / GPT1_DIVIDER;
+/// GPT2 timer frequency in Hz.
 pub const GPT2_FREQUENCY: u32 = clock_tree::gpt_frequency::<2>(RUN_MODE) / GPT2_DIVIDER;
+/// UART clock frequency in Hz.
 pub const UART_CLK_FREQUENCY: u32 = clock_tree::lpuart_frequency::<1>(RUN_MODE);
-pub const CONSOLE_BAUD: hal::lpuart::Baud = hal::lpuart::Baud::compute(UART_CLK_FREQUENCY, 115200);
+/// Console baud rate configuration (115200 bps).
+pub const CONSOLE_BAUD: hal::lpuart::Baud = hal::lpuart::Baud::compute(UART_CLK_FREQUENCY, 115_200);
+/// LPSPI clock frequency in Hz.
 pub const LPSPI_CLK_FREQUENCY: u32 = clock_tree::lpspi_frequency::<SPI_INSTANCE>(RUN_MODE);
+/// LPI2C clock frequency in Hz.
 pub const LPI2C_CLK_FREQUENCY: u32 = clock_tree::lpi2c_frequency::<I2C_INSTANCE>(RUN_MODE);
+/// PWM prescaler configuration.
 pub const PWM_PRESCALER: hal::flexpwm::Prescaler = hal::flexpwm::Prescaler::Prescaler8;
+/// PWM base frequency in Hz.
 pub const PWM_FREQUENCY: u32 = clock_tree::bus_frequency(RUN_MODE) / PWM_PRESCALER.divider();
+/// Ethernet peripheral clock frequency in Hz.
 pub const ENET_FREQUENCY: u32 = clock_tree::ENET1_FREQUENCY;
+/// Ethernet bus frequency in Hz.
 pub const ENET_BUS_FREQUENCY: u32 = clock_tree::bus_frequency(RUN_MODE);
 
-pub type Led = hal::gpio::Output<iomuxc::gpio_ad::GPIO_AD_04>;
+/// On-board LED (`GPIO_AD_04`).
+pub type Led = hal::gpio::Output<iomuxc::pads::gpio_ad::GPIO_AD_04>;
 
 /// SW7, the "CPU wakeup" button.
 pub type Button = hal::gpio::Input<()>;
 
+/// LPUART pins for the console (TX: `GPIO_AD_24`, RX: `GPIO_AD_25`).
 pub type ConsolePins = hal::lpuart::Pins<
-    iomuxc::gpio_ad::GPIO_AD_24, // TX, interfaced with debug chip
-    iomuxc::gpio_ad::GPIO_AD_25, // RX, interfaced with debug chip
+    iomuxc::pads::gpio_ad::GPIO_AD_24, // TX, interfaced with debug chip
+    iomuxc::pads::gpio_ad::GPIO_AD_25, // RX, interfaced with debug chip
 >;
 const CONSOLE_INSTANCE: u8 = 1;
+/// LPUART1 console peripheral.
 pub type Console = hal::lpuart::Lpuart<ConsolePins, { CONSOLE_INSTANCE }>;
 
 /// Test point 1002.
 ///
 /// For evaluating clocks via `CCM_CLKO1`.
-pub type Tp1002 = iomuxc::gpio_emc_b1::GPIO_EMC_B1_40;
+pub type Tp1002 = iomuxc::pads::gpio_emc_b1::GPIO_EMC_B1_40;
 
 /// Test point 1003.
 ///
 /// For evaluating clocks via `CCM_CLKO2`.
-pub type Tp1003 = iomuxc::gpio_emc_b1::GPIO_EMC_B1_41;
+pub type Tp1003 = iomuxc::pads::gpio_emc_b1::GPIO_EMC_B1_41;
 
+/// SPI data pins routed to J10 connector.
 pub type SpiPins = hal::lpspi::Pins<
-    iomuxc::gpio_ad::GPIO_AD_30, // SDO, J10_8
-    iomuxc::gpio_ad::GPIO_AD_31, // SDI, J10_10
-    iomuxc::gpio_ad::GPIO_AD_28, // SCK, J10_12
+    iomuxc::pads::gpio_ad::GPIO_AD_30, // SDO, J10_8
+    iomuxc::pads::gpio_ad::GPIO_AD_31, // SDI, J10_10
+    iomuxc::pads::gpio_ad::GPIO_AD_28, // SCK, J10_12
 >;
-/// SPI PCS0 (J10_6).
-pub type SpiPcs0 = iomuxc::gpio_ad::GPIO_AD_29;
+/// SPI PCS0 (`J10_6`).
+pub type SpiPcs0 = iomuxc::pads::gpio_ad::GPIO_AD_29;
 const SPI_INSTANCE: u8 = 1;
 
-#[cfg(feature = "spi")]
+/// LPSPI1 peripheral configured for J10 connector.
 pub type Spi = hal::lpspi::Lpspi<SpiPins, { SPI_INSTANCE }>;
-#[cfg(not(feature = "spi"))]
-pub type Spi = ();
 
+/// I2C pins routed to J10 connector.
 pub type I2cPins = hal::lpi2c::Pins<
-    iomuxc::gpio_lpsr::GPIO_LPSR_05, // SCL, J10_20
-    iomuxc::gpio_lpsr::GPIO_LPSR_04, // SDA, J10_18
+    iomuxc::pads::gpio_lpsr::GPIO_LPSR_05, // SCL, J10_20
+    iomuxc::pads::gpio_lpsr::GPIO_LPSR_04, // SDA, J10_18
 >;
 
 const I2C_INSTANCE: u8 = 5;
+/// LPI2C5 peripheral configured for J10 connector.
 pub type I2c = hal::lpi2c::Lpi2c<I2cPins, { I2C_INSTANCE }>;
 
 const PWM_INSTANCE: u8 = 2;
 
-#[cfg(not(feature = "spi"))]
+/// PWM type definitions for the board.
 pub mod pwm {
-    use super::iomuxc;
-    use super::PWM_INSTANCE;
-    use crate::hal::flexpwm;
-
-    pub type Peripheral = flexpwm::Pwm<{ PWM_INSTANCE }>;
-    pub type Submodule = flexpwm::Submodule<{ PWM_INSTANCE }, 2>;
-    pub type Outputs = (
-        flexpwm::Output<iomuxc::gpio_ad::GPIO_AD_28>, // A, J9_8
-        flexpwm::Output<iomuxc::gpio_ad::GPIO_AD_29>, // B, J9_12
-    );
-}
-
-#[cfg(feature = "spi")]
-pub mod pwm {
+    /// `FlexPWM` peripheral type.
     pub type Peripheral = ();
+    /// PWM submodule type.
     pub type Submodule = ();
+    /// PWM output pins type.
     pub type Outputs = ();
 }
 
@@ -158,61 +213,81 @@ pub struct Pwm {
     pub outputs: pwm::Outputs,
 }
 
+/// GPIO port instances for the board.
 pub struct GpioPorts {
     gpio13: hal::gpio::Port<13>,
 }
 
 impl GpioPorts {
-    pub fn button_mut(&mut self) -> &mut hal::gpio::Port<13> {
+    /// Returns a mutable reference to GPIO port 13 (used for button).
+    pub const fn button_mut(&mut self) -> &mut hal::gpio::Port<13> {
         &mut self.gpio13
     }
 }
 
+/// Board-specific peripherals and pins for the i.MX RT 1170 EVK.
 pub struct Specifics {
+    /// On-board LED.
     pub led: Led,
+    /// User button (SW7).
     pub button: Button,
+    /// GPIO ports.
     pub ports: GpioPorts,
+    /// Console UART.
     pub console: Console,
+    /// Test point 1002 (`CCM_CLKO1`).
     pub tp1002: Tp1002,
+    /// Test point 1003 (`CCM_CLKO2`).
     pub tp1003: Tp1003,
+    /// SPI peripheral.
     pub spi: Spi,
+    /// PWM peripheral.
     pub pwm: Pwm,
+    /// I2C peripheral.
     pub i2c: I2c,
+    /// Ethernet peripheral (ENET) instance.
     pub enet: imxrt_ral::enet::ENET,
 }
 
 impl Specifics {
-    pub(crate) fn new(common: &mut crate::Common) -> Self {
+    /// Initializes board-specific peripherals and pins.
+    pub fn new(common: &mut crate::Common) -> Self {
+        const ENET_INT: u32 = 1 << 11;
+        const ENET_RST: u32 = 1 << 12;
+
         // Manually configuring IOMUXC_SNVS pads, since there's no
         // equivalent API in imxrt-iomuxc.
+        // SAFETY: accessing the RAL is inherently unsafe
         let iomuxc_snvs = unsafe { ral::iomuxc_snvs::IOMUXC_SNVS::instance() };
         // ALT5 => GPIO13[00]
         ral::write_reg!(ral::iomuxc_snvs, iomuxc_snvs, SW_MUX_CTL_PAD_WAKEUP_DIG, MUX_MODE: 5);
         // Pull up the pin to be brought to GND on switch press. No need for a high drive.
         ral::write_reg!(ral::iomuxc_snvs, iomuxc_snvs, SW_PAD_CTL_PAD_WAKEUP_DIG, PUS: 1, PUE: 1, DSE: 0);
 
+        // SAFETY: accessing the RAL is inherently unsafe
         let gpio13 = unsafe { ral::gpio::GPIO13::instance() };
         let mut gpio13 = hal::gpio::Port::new(gpio13);
         let button = hal::gpio::Input::without_pin(&mut gpio13, 0);
 
-        let iomuxc = unsafe { ral::iomuxc::IOMUXC::instance() };
+        // SAFETY: accessing the RAL is inherently unsafe
         let iomuxc_gpr = unsafe { ral::iomuxc_gpr::IOMUXC_GPR::instance() };
         // ENET_REF_CLK driven by ENET1_CLK_ROOT.
         ral::modify_reg!(ral::iomuxc_gpr, iomuxc_gpr, GPR4, ENET_REF_CLK_DIR: 1);
         // Handle ERR050396. Depending on the runtime config, we might place buffers into TCM.
         ral::modify_reg!(ral::iomuxc_gpr, iomuxc_gpr, GPR28, CACHE_ENET1G: 0, CACHE_ENET: 0);
 
-        let mut iomuxc = unsafe { ral::iomuxc::IOMUXC::instance() };
-        let mut iomuxc_lpsr = unsafe { ral::iomuxc_lpsr::IOMUXC_LPSR::instance() };
-        configure_eth_pins(&mut iomuxc, &mut iomuxc_lpsr);
+        // SAFETY: accessing the RAL is inherently unsafe
+        let iomuxc = unsafe { ral::iomuxc::IOMUXC::instance() };
+        // SAFETY: accessing the RAL is inherently unsafe
+        let iomuxc_lpsr = unsafe { ral::iomuxc_lpsr::IOMUXC_LPSR::instance() };
+        configure_eth_pins(&iomuxc, &iomuxc_lpsr);
         let mut iomuxc = super::convert_iomuxc(iomuxc);
         configure_pins(&mut iomuxc);
 
+        // SAFETY: accessing the RAL is inherently unsafe
         let gpio9 = unsafe { ral::gpio::GPIO9::instance() };
+        // SAFETY: accessing the RAL is inherently unsafe
         let gpio12 = unsafe { ral::gpio::GPIO12::instance() };
-
-        const ENET_INT: u32 = 1 << 11;
-        const ENET_RST: u32 = 1 << 12;
         ral::modify_reg!(ral::gpio, gpio9, GDIR, |gdir| gdir | ENET_INT);
         ral::modify_reg!(ral::gpio, gpio12, GDIR, |gdir| gdir | ENET_RST);
 
@@ -224,14 +299,14 @@ impl Specifics {
         common.block_ms(500);
         ral::write_reg!(ral::gpio, gpio12, DR_SET, ENET_RST);
         common.block_ms(500);
-
         let mut gpio9 = hal::gpio::Port::new(gpio9);
         let led = gpio9.output(iomuxc.gpio_ad.p04);
 
         // let ccm_enet_25mh_ref = gpio9.output(iomuxc.gpio_ad.p14);
         // ccm_enet_25mh_ref.set();
-        hal::iomuxc::alternate(&mut iomuxc.gpio_ad.p14, 9);
+        iomuxc::alternate(&mut iomuxc.gpio_ad.p14, 9);
 
+        // SAFETY: accessing the RAL is inherently unsafe
         let console = unsafe { ral::lpuart::Instance::<{ CONSOLE_INSTANCE }>::instance() };
         let mut console = hal::lpuart::Lpuart::new(
             console,
@@ -246,15 +321,15 @@ impl Specifics {
         });
         hal::usbphy::restart_pll(&mut common.usbphy1);
 
-        #[cfg(feature = "spi")]
         let spi = {
+            // SAFETY: accessing the RAL is inherently unsafe
             let lpspi1 = unsafe { ral::lpspi::LPSPI1::instance() };
             let pins = SpiPins {
                 sdo: iomuxc.gpio_ad.p30,
                 sdi: iomuxc.gpio_ad.p31,
                 sck: iomuxc.gpio_ad.p28,
             };
-            crate::iomuxc::lpspi::prepare({
+            iomuxc::lpspi::prepare({
                 let pcs0: &mut SpiPcs0 = &mut iomuxc.gpio_ad.p29;
                 pcs0
             });
@@ -264,31 +339,13 @@ impl Specifics {
             });
             spi
         };
-        #[cfg(not(feature = "spi"))]
-        #[allow(clippy::let_unit_value)]
-        let spi = ();
-
-        #[cfg(not(feature = "spi"))]
-        let pwm = {
-            let flexpwm = unsafe { ral::pwm::PWM2::instance() };
-            let (pwm, (_, _, sm, _)) = hal::flexpwm::new(flexpwm);
-
-            let out_a = hal::flexpwm::Output::new_a(iomuxc.gpio_ad.p28);
-            let out_b = hal::flexpwm::Output::new_b(iomuxc.gpio_ad.p29);
-
-            super::Pwm {
-                module: pwm,
-                submodule: sm,
-                outputs: (out_a, out_b),
-            }
-        };
-        #[cfg(feature = "spi")]
         let pwm = Pwm {
             module: (),
             submodule: (),
             outputs: (),
         };
         let i2c = {
+            // SAFETY: accessing the RAL is inherently unsafe
             let lpi2c5 = unsafe { ral::lpi2c::LPI2C5::instance() };
             I2c::new(
                 lpi2c5,
@@ -310,6 +367,7 @@ impl Specifics {
             spi,
             pwm,
             i2c,
+            // SAFETY: accessing the RAL is inherently unsafe
             enet: unsafe { imxrt_ral::enet::ENET::instance() },
         }
     }
@@ -319,8 +377,8 @@ fn configure_pins(iomuxc: &mut super::Pads) {
     // Set the pin muxing for the two test points.
     let clko1: &mut Tp1002 = &mut iomuxc.gpio_emc_b1.p40;
     let clko2: &mut Tp1003 = &mut iomuxc.gpio_emc_b1.p41;
-    crate::iomuxc::ccm::prepare(clko1);
-    crate::iomuxc::ccm::prepare(clko2);
+    iomuxc::ccm::prepare(clko1);
+    iomuxc::ccm::prepare(clko2);
 
     // Can't use imxrt-iomuxc configuration APIs for this chip.
     // See the -iomuxc issue tracker for more information.
@@ -335,10 +393,9 @@ fn configure_pins(iomuxc: &mut super::Pads) {
     ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_AD_28, DSE: DSE_1_HIGH_DRIVER);
     ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_AD_29, DSE: DSE_1_HIGH_DRIVER);
 }
-
 fn configure_eth_pins(
-    iomuxc: &mut ral::iomuxc::IOMUXC,
-    iomuxc_lpsr: &mut ral::iomuxc_lpsr::IOMUXC_LPSR,
+    iomuxc: &ral::iomuxc::IOMUXC,
+    iomuxc_lpsr: &ral::iomuxc_lpsr::IOMUXC_LPSR,
 ) {
     //
     // Muxing
@@ -371,7 +428,7 @@ fn configure_eth_pins(
     ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_DISP_B2_08, SRE: SRE_0_SLOW_SLEW_RATE, DSE: DSE_1_HIGH_DRIVER, PUE: PUE_1_PULL_ENABLE, PUS: PUS_0_WEAK_PULL_DOWN, ODE: ODE_0_DISABLED);
     ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_DISP_B2_09, SRE: SRE_0_SLOW_SLEW_RATE, DSE: DSE_1_HIGH_DRIVER, PUE: PUE_1_PULL_ENABLE, PUS: PUS_0_WEAK_PULL_DOWN, ODE: ODE_0_DISABLED);
 
-    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_AD_12, SRE: SRE_0_SLOW_SLEW_RATE, DSE: DSE_1_HIGH_DRIVER, PUE: PUE_1_PULL, PUS: PUS_0_WEAK_PULL_DOWN, ODE: ODE_0_OPEN_DRAIN_DISABLED);
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_AD_12, SRE: SRE_0_SLOW_SLEW_RATE, DSE: DSE_1_HIGH_DRIVER, PUE: PUE_1_PULL_ENABLE, PUS: PUS_0_WEAK_PULL_DOWN, ODE: ODE_0_DISABLED);
     ral::write_reg!(ral::iomuxc_lpsr, iomuxc_lpsr, SW_PAD_CTL_PAD_GPIO_LPSR_12, SRE: SRE_0_SLOW_SLEW_RATE, DSE: DSE_1_HIGH_DRIVER, PUE: PUE_1_PULL, PUS: PUS_1_WEAK_PULL_UP, ODE_LPSR: ODE_LPSR_0_DISABLED);
 
     //
@@ -429,7 +486,7 @@ fn init_enet_phy_ksz8081rnb<
         }
     }
 
-    let mut retries = 100000usize;
+    let mut retries = 100_000_usize;
     while retries > 0 {
         const KSZ8081_ID: u16 = 0x22;
         let address = mdio.read(KSZ8081_PHY_ADDR, PHY_ID1_REG).unwrap();
@@ -486,6 +543,7 @@ fn init_enet_phy_ksz8081rnb<
     Ok(())
 }
 
+#[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
 fn init_enet_phy_rtl8211f<
     M: hal::enet::MiimRead<Error = hal::enet::MiiError>
         + hal::enet::MiimWrite<Error = hal::enet::MiiError>,
@@ -503,27 +561,40 @@ pub fn init_enet_phy<
 >(
     mdio: &mut M,
 ) -> Result<(), &'static str> {
-    init_enet_phy_ksz8081rnb(mdio)?;
+    // init_enet_phy_ksz8081rnb(mdio)?;
     init_enet_phy_rtl8211f(mdio)?;
     Ok(())
 }
 
+/// Board interrupt mappings and configuration.
 pub mod interrupt {
     use crate::board_interrupts as syms;
     use crate::ral::Interrupt;
 
+    /// Console UART interrupt (LPUART1).
     pub const BOARD_CONSOLE: Interrupt = Interrupt::LPUART1;
+    /// Button GPIO interrupt.
     pub const BOARD_BUTTON: Interrupt = Interrupt::GPIO13_COMBINED_0_31;
+    /// DMA channel A interrupt.
     pub const BOARD_DMA_A: Interrupt = Interrupt::DMA7_DMA23;
+    /// DMA channel B interrupt.
     pub const BOARD_DMA_B: Interrupt = Interrupt::DMA11_DMA27;
+    /// PIT timer interrupt.
     pub const BOARD_PIT: Interrupt = Interrupt::PIT1;
+    /// GPT1 timer interrupt.
     pub const BOARD_GPT1: Interrupt = Interrupt::GPT1;
+    /// GPT2 timer interrupt.
     pub const BOARD_GPT2: Interrupt = Interrupt::GPT2;
+    /// SPI interrupt (LPSPI1).
     pub const BOARD_SPI: Interrupt = Interrupt::LPSPI1;
+    /// PWM interrupt.
     pub const BOARD_PWM: Interrupt = Interrupt::PWM2_2;
+    /// USB1 interrupt.
     pub const BOARD_USB1: Interrupt = Interrupt::USB_OTG1;
+    /// Software task 0 interrupt.
     pub const BOARD_SWTASK0: Interrupt = Interrupt::KPP;
 
+    /// Interrupt vector table mappings for the board.
     pub const INTERRUPTS: &[(Interrupt, syms::Vector)] = &[
         (BOARD_CONSOLE, syms::BOARD_CONSOLE),
         (BOARD_BUTTON, syms::BOARD_BUTTON),
@@ -539,32 +610,3 @@ pub mod interrupt {
     ];
 }
 
-pub use interrupt as Interrupt;
-
-/// Helpers for the clock_out example.
-pub mod clock_out {
-    use crate::hal::ccm::output_source::{clko1::Selection as Clko1, clko2::Selection as Clko2};
-
-    pub const CLKO1_SELECTIONS: [Clko1; 8] = [
-        Clko1::OscRc48MDiv2,
-        Clko1::Osc24M,
-        Clko1::OscRc400M,
-        Clko1::OscRc16M,
-        Clko1::SysPll2Pfd2,
-        Clko1::SysPll2CLK,
-        Clko1::SysPll3Pfd1,
-        Clko1::SysPll1Div5,
-    ];
-    pub const CLKO2_SELECTIONS: [Clko2; 8] = [
-        Clko2::OscRc48MDiv2,
-        Clko2::Osc24M,
-        Clko2::OscRc400M,
-        Clko2::OscRc16M,
-        Clko2::SysPll2Pfd3,
-        Clko2::OscRc400M,
-        Clko2::SysPll3Pfd1,
-        Clko2::AudioPllClk,
-    ];
-
-    pub const MAX_DIVIDER_VALUE: u32 = 256;
-}

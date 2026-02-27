@@ -13,9 +13,9 @@
 //! See the 10xx documentation for an example.
 
 use crate::{
+    RunMode,
     hal::ccm::XTAL_OSCILLATOR_HZ,
     ral::{self, ccm::CCM},
-    RunMode,
 };
 
 /// A clock source.
@@ -24,14 +24,16 @@ use crate::{
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[allow(unused)] // TODO remove once there's more development here.
 enum ClockSource {
-    /// ARM_PLL, for the Cortex M7.
+    /// `ARM_PLL`, for the Cortex M7.
     ArmCm7,
-    /// SYS_PLL1, with dedicated 1GHz frequency
+    /// `SYS_PLL1`, with dedicated 1GHz frequency
     /// for ETH.
     SysPll1,
-    /// SYS_PLL2, main PLL (no PFDs).
+    /// `SYS_PLL1` with a fixed divide-by-2.
+    SysPll1Div2,
+    /// `SYS_PLL2`, main PLL (no PFDs).
     SysPll2,
-    /// SYS_PLL3, main PLL (no PDFs).
+    /// `SYS_PLL3`, main PLL (no PDFs).
     SysPll3,
     /// 24MHz XTAL.
     ///
@@ -48,12 +50,13 @@ impl ClockSource {
     /// Returns the frequency (Hz) of the PLL for a given run mode.
     const fn frequency(self, run_mode: RunMode) -> u32 {
         match (self, run_mode) {
-            (ClockSource::ArmCm7, RunMode::Overdrive) => 1_000_000_000, // Brr...
-            (ClockSource::SysPll1, _) => 1_000_000_000,
-            (ClockSource::SysPll2, _) => 528_000_000,
-            (ClockSource::SysPll3, _) => 480_000_000,
-            (ClockSource::XtalOsc24MHz, _) => XTAL_OSCILLATOR_HZ,
-            (ClockSource::RcOsc400MHz, _) => 400_000_000,
+            // Brr...
+            (Self::ArmCm7, RunMode::Overdrive) | (Self::SysPll1, _) => 1_000_000_000,
+            (Self::SysPll1Div2, _) => 1_000_000_000 / 2,
+            (Self::SysPll2, _) => 528_000_000,
+            (Self::SysPll3, _) => 480_000_000,
+            (Self::XtalOsc24MHz, _) => XTAL_OSCILLATOR_HZ,
+            (Self::RcOsc400MHz, _) => 400_000_000,
         }
     }
 }
@@ -87,14 +90,14 @@ const fn bus_selection(run_mode: RunMode) -> Selection {
 }
 
 /// Returns the target bus clock frequency for the run mode.
-pub const fn bus_frequency(run_mode: RunMode) -> u32 {
+pub(crate) const fn bus_frequency(run_mode: RunMode) -> u32 {
     bus_selection(run_mode).frequency(run_mode)
 }
 
 const _: () = assert!(bus_frequency(RunMode::Overdrive) == 200_000_000); // 240MHz max.
 
-#[inline(always)]
-fn configure_clock_root(offset: usize, selection: &Selection, ccm: &mut CCM) {
+#[inline]
+fn configure_clock_root(offset: usize, selection: &Selection, ccm: &CCM) {
     let clock_root = &ccm.CLOCK_ROOT[offset];
     ral::modify_reg!(ral::ccm::clockroot, clock_root, CLOCK_ROOT_CONTROL,
         DIV: selection.divider - 1,
@@ -107,6 +110,12 @@ fn configure_clock_root(offset: usize, selection: &Selection, ccm: &mut CCM) {
     ) {}
 }
 
+#[inline]
+fn clock_root_on(offset: usize, ccm: &CCM, on: bool) {
+    let clock_root = &ccm.CLOCK_ROOT[offset];
+    ral::modify_reg!(ral::ccm::clockroot, clock_root, CLOCK_ROOT_CONTROL, OFF: u32::from(!on));
+}
+
 /// Set the bus clock (IPG) configuration for the Cortex M7.
 ///
 /// When this call returns, the bus clock frequency matches the value returned
@@ -114,7 +123,7 @@ fn configure_clock_root(offset: usize, selection: &Selection, ccm: &mut CCM) {
 ///
 /// This function may disable clock gates for various peripherals. It may leave
 /// these clock gates disabled.
-pub fn configure_bus(run_mode: RunMode, ccm: &mut CCM) {
+pub(crate) fn configure_bus(run_mode: RunMode, ccm: &CCM) {
     configure_clock_root(2, &bus_selection(run_mode), ccm);
 }
 
@@ -129,8 +138,8 @@ const fn gpt_selection<const N: u8>(run_mode: RunMode) -> Selection {
     }
 }
 
-/// Returns the target GPTn clock frequency for the run mode.
-pub const fn gpt_frequency<const N: u8>(run_mode: RunMode) -> u32
+/// Returns the target `GPTn` clock frequency for the run mode.
+pub(crate) const fn gpt_frequency<const N: u8>(run_mode: RunMode) -> u32
 where
     ral::gpt::Instance<N>: ral::Valid,
 {
@@ -139,14 +148,14 @@ where
 
 const _: () = assert!(gpt_frequency::<1>(RunMode::Overdrive) == 100_000_000); // 240MHz max.
 
-/// Set the GPTn clock configuration.
+/// Set the `GPTn` clock configuration.
 ///
-/// When this call returns, the GPTn clock frequency matches the value
+/// When this call returns, the `GPTn` clock frequency matches the value
 /// returned by [`gpt_frequency`].
 ///
 /// This function may disable clock gates for various peripherals. It may leave
 /// these clock gates disabled.
-pub fn configure_gpt<const N: u8>(run_mode: RunMode, ccm: &mut CCM)
+pub(crate) fn configure_gpt<const N: u8>(run_mode: RunMode, ccm: &CCM)
 where
     ral::gpt::Instance<N>: ral::Valid,
 {
@@ -166,8 +175,8 @@ const fn lpuart_selection<const N: u8>(run_mode: RunMode) -> Selection {
     }
 }
 
-/// Returns the target LPUARTn clock frequency for the run mode.
-pub const fn lpuart_frequency<const N: u8>(run_mode: RunMode) -> u32
+/// Returns the target `LPUARTn` clock frequency for the run mode.
+pub(crate) const fn lpuart_frequency<const N: u8>(run_mode: RunMode) -> u32
 where
     ral::lpuart::Instance<N>: ral::Valid,
 {
@@ -176,14 +185,14 @@ where
 
 const _: () = assert!(lpuart_frequency::<1>(RunMode::Overdrive) == 80_000_000); // Max allowed.
 
-/// Set the LPUARTn clock configuration.
+/// Set the `LPUARTn` clock configuration.
 ///
-/// When this call returns, the LPUARTn clock frequency matches the value
+/// When this call returns, the `LPUARTn` clock frequency matches the value
 /// returned by [`lpuart_frequency`].
 ///
 /// This function may disable clock gates for various peripherals. It may leave
 /// these clock gates disabled.
-pub fn configure_lpuart<const N: u8>(run_mode: RunMode, ccm: &mut CCM)
+pub(crate) fn configure_lpuart<const N: u8>(run_mode: RunMode, ccm: &CCM)
 where
     ral::lpuart::Instance<N>: ral::Valid,
 {
@@ -202,8 +211,8 @@ const fn lpi2c_selection<const N: u8>(run_mode: RunMode) -> Selection {
     }
 }
 
-/// Returns the target LPI2Cn clock frequency for the run mode.
-pub const fn lpi2c_frequency<const N: u8>(run_mode: RunMode) -> u32
+/// Returns the target `LPI2Cn` clock frequency for the run mode.
+pub(crate) const fn lpi2c_frequency<const N: u8>(run_mode: RunMode) -> u32
 where
     ral::lpi2c::Instance<N>: ral::Valid,
 {
@@ -212,14 +221,14 @@ where
 
 const _: () = assert!(lpi2c_frequency::<1>(RunMode::Overdrive) == 8_000_000); // Max is 66MHz.
 
-/// Set the LPI2Cn clock configuration.
+/// Set the `LPI2Cn` clock configuration.
 ///
-/// When this call returns, the LPI2Cn clock frequency matches the value
+/// When this call returns, the `LPI2Cn` clock frequency matches the value
 /// returned by [`lpi2c_frequency`].
 ///
 /// This function may disable clock gates for various peripherals. It may leave
 /// these clock gates disabled.
-pub fn configure_lpi2c<const N: u8>(run_mode: RunMode, ccm: &mut CCM)
+pub(crate) fn configure_lpi2c<const N: u8>(run_mode: RunMode, ccm: &CCM)
 where
     ral::lpi2c::Instance<N>: ral::Valid,
 {
@@ -238,8 +247,8 @@ const fn lpspi_selection<const N: u8>(run_mode: RunMode) -> Selection {
     }
 }
 
-/// Returns the target LPSPIn clock frequency for the run mode.
-pub const fn lpspi_frequency<const N: u8>(run_mode: RunMode) -> u32
+/// Returns the target `LPSPIn` clock frequency for the run mode.
+pub(crate) const fn lpspi_frequency<const N: u8>(run_mode: RunMode) -> u32
 where
     ral::lpspi::Instance<N>: ral::Valid,
 {
@@ -248,14 +257,14 @@ where
 
 const _: () = assert!(lpspi_frequency::<1>(RunMode::Overdrive) == 100_000_000); // Max is 135MHz.
 
-/// Set the LPSPICn clock configuration.
+/// Set the `LPSPICn` clock configuration.
 ///
-/// When this call returns, the LPSPICn clock frequency matches the value
+/// When this call returns, the `LPSPICn` clock frequency matches the value
 /// returned by [`lpspi_frequency`].
 ///
 /// This function may disable clock gates for various peripherals. It may leave
 /// these clock gates disabled.
-pub fn configure_lpspi<const N: u8>(run_mode: RunMode, ccm: &mut CCM)
+pub(crate) fn configure_lpspi<const N: u8>(run_mode: RunMode, ccm: &CCM)
 where
     ral::lpspi::Instance<N>: ral::Valid,
 {
@@ -263,3 +272,45 @@ where
     // LPSPI6 -> CLOCK_ROOT48
     configure_clock_root(N as usize + 42, &lpspi_selection::<N>(run_mode), ccm);
 }
+
+
+pub(crate) const ENET1_FREQUENCY: u32 = 50_000_000;
+
+/// Turn on / off all ENET root clocks.
+pub(crate) fn enet_root_on(ccm: &CCM, on: bool) {
+    for offset in 51..=57 {
+        clock_root_on(offset, ccm, on);
+    }
+}
+
+/// Configure clocks for all-things ETH.
+///
+/// When this call returns, the ENET clock frequencies matches the value returned
+/// by [`enet_frequency`].
+pub(crate) fn configure_enet(run_mode: RunMode, ccm: &CCM) {
+    const ENET1_ROOT_CLOCK_SOURCE: ClockSource = ClockSource::SysPll1Div2;
+    let enet1_divider: u32 = ENET1_ROOT_CLOCK_SOURCE.frequency(run_mode) / ENET1_FREQUENCY;
+    configure_clock_root(
+        51,
+        &Selection {
+            mux: 4,
+            source: ENET1_ROOT_CLOCK_SOURCE,
+            divider: enet1_divider,
+        },
+        ccm,
+    );
+
+    // All other ENET clocks are at 24MHz.
+    for offset in 52..=57 {
+        configure_clock_root(
+            offset,
+            &Selection {
+                mux: 0b001,
+                source: ClockSource::XtalOsc24MHz,
+                divider: 1,
+            },
+            ccm,
+        );
+    }
+}
+
